@@ -1,0 +1,453 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index aadb067dc..8b6e84b36 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -951,6 +951,10 @@ class GatewayRunner:
+     # blow up on attribute access.
+     _running_agents_ts: Dict[str, float] = {}
+     _busy_input_mode: str = "interrupt"
++    # Parallel agent tracking: parent_session_key -> [fork_key_1, fork_key_2, ...]
++    # Registered in _run_concurrent_turn, cleared when the parallel turn completes.
++    # Initialized in __init__ alongside _running_agents.
++    _parallel_agents: Dict[str, Dict[str, dict]] = {}  # class-level default only
+     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+     _exit_code: Optional[int] = None
+     _draining: bool = False
+@@ -1028,6 +1032,7 @@ class GatewayRunner:
+         self._running_agents: Dict[str, Any] = {}
+         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
++        self._parallel_agents: Dict[str, Dict[str, dict]] = {}  # parallel fork tracking: parent_key -> {fork_key: {start_time, message_preview}}
+         # Overflow buffer for explicit /queue commands.  The adapter-level
+         # _pending_messages dict is a single slot per session (designed for
+         # "next-turn" follow-ups where repeated sends collapse into one
+@@ -1153,6 +1158,9 @@ class GatewayRunner:
+         # Track background tasks to prevent garbage collection mid-execution
+         self._background_tasks: set = set()
+ 
++        # Domain-name ideator (opt-in via DOMAIN_IDEA_CHANNELS). Set in start().
++        self._domain_service = None
++
+ 
+     def _warn_if_docker_media_delivery_is_risky(self) -> None:
+         """Warn when Docker-backed gateways lack an explicit export mount.
+@@ -1922,6 +1930,8 @@ class GatewayRunner:
+             return "queue"
+         if mode == "steer":
+             return "steer"
++        if mode == "concurrent":
++            return "concurrent"
+         return "interrupt"
+ 
+     @staticmethod
+@@ -2102,6 +2112,34 @@ class GatewayRunner:
+                 # Fall back to queue (merge into pending messages, no interrupt)
+                 effective_mode = "queue"
+ 
++        # Concurrent mode: spawn a parallel turn without touching the running agent.
++        # Do NOT merge into pending_messages — the parallel turn gets its own session.
++        if effective_mode == "concurrent":
++            logger.debug(
++                "Concurrent follow-up via busy handler for session %s — dispatching parallel turn",
++                session_key,
++            )
++            asyncio.create_task(
++                self._run_concurrent_turn(event, event.source, session_key)
++            )
++            # Acknowledge so the user knows a parallel turn started.
++            adapter = self.adapters.get(event.source.platform)
++            if adapter:
++                try:
++                    from dataclasses import replace as _replace
++                    _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
++                    _parallel_status = self._get_parallel_agents_status(session_key)
++                    _ack = "⚡ Processing in parallel...\n" + _parallel_status if _parallel_status else "⚡ Processing in parallel..."
++                    _r = await adapter._send_with_retry(
++                        chat_id=event.source.chat_id,
++                        content=_ack,
++                        reply_to=event.message_id,
++                        metadata=_thread_meta,
++                    )
++                except Exception:
++                    pass
++            return True
++
+         # Store the message so it's processed as the next turn after the
+         # current run finishes (or is interrupted).  Skip this for a
+         # successful steer — the text already landed inside the run and
+@@ -2940,7 +2978,19 @@ class GatewayRunner:
+             logger.info("Channel directory built: %d target(s)", ch_count)
+         except Exception as e:
+             logger.warning("Channel directory build failed: %s", e)
+-        
++
++        # Start the domain-idea service if any Discord adapter connected.
++        try:
++            discord_adapter = self.adapters.get(Platform.DISCORD)
++            if discord_adapter is not None:
++                from gateway.domain_ideas import DomainIdeaService
++                self._domain_service = DomainIdeaService(discord_adapter)
++                # Expose on the adapter so on_message can call ingest().
++                setattr(discord_adapter, "_domain_service", self._domain_service)
++                await self._domain_service.start()
++        except Exception as e:
++            logger.warning("DomainIdeaService failed to start: %s", e, exc_info=True)
++
+         # Check if we're restarting after a /update command. If the update is
+         # still running, keep watching so we notify once it actually finishes.
+         notified = await self._send_update_notification()
+@@ -3732,6 +3782,11 @@ class GatewayRunner:
+             )
+             self._running = False
+             self._draining = True
++            if self._domain_service is not None:
++                try:
++                    await self._domain_service.stop()
++                except Exception:
++                    pass
+ 
+             # Notify all chats with active agents BEFORE draining.
+             # Adapters are still connected here, so messages can be sent.
+@@ -5007,6 +5062,12 @@ class GatewayRunner:
+                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
+                 self._queue_or_replace_pending_event(_quick_key, event)
+                 return None
++            if self._busy_input_mode == "concurrent":
++                logger.debug("PRIORITY concurrent for session %s — dispatching parallel turn", _quick_key)
++                asyncio.create_task(
++                    self._run_concurrent_turn(event, source, _quick_key)
++                )
++                return None
+             logger.debug("PRIORITY interrupt for session %s", _quick_key)
+             running_agent.interrupt(event.text)
+             if _quick_key in self._pending_messages:
+@@ -5183,6 +5244,9 @@ class GatewayRunner:
+         if canonical == "background":
+             return await self._handle_background_command(event)
+ 
++        if canonical == "parallel":
++            return await self._handle_parallel_command(event)
++
+         if canonical == "steer":
+             # No active agent — /steer has no tool call to inject into.
+             # Strip the prefix so downstream treats it as a normal user
+@@ -5595,7 +5659,10 @@ class GatewayRunner:
+             return []
+         return list(pending_native.pop(session_key, []) or [])
+ 
+-    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
++    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int,
++                                           session_key_override: Optional[str] = None,
++                                           parallel_context_text: str = "",
++                                           inherited_context: Optional[List[Dict]] = None):
+         """Inner handler that runs under the _running_agents sentinel guard."""
+         _msg_start_time = time.time()
+         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+@@ -5607,7 +5674,10 @@ class GatewayRunner:
+         )
+ 
+         # Get or create session
+-        session_entry = self.session_store.get_or_create_session(source)
++        if session_key_override:
++            session_entry = self.session_store.get_or_create_session(source, session_key_override=session_key_override)
++        else:
++            session_entry = self.session_store.get_or_create_session(source)
+         session_key = session_entry.session_key
+         if getattr(session_entry, "was_auto_reset", False):
+             # Treat auto-reset as a full conversation boundary — drop every
+@@ -5640,6 +5710,10 @@ class GatewayRunner:
+         # Build session context
+         context = build_session_context(source, self.config, session_entry)
+         
++        # Inject parallel coordination context for forked turns
++        if parallel_context_text:
++            context.parallel_context_text = parallel_context_text
++        
+         # Set session context variables for tools (task-local, concurrency-safe)
+         _session_env_tokens = self._set_session_env(context)
+         
+@@ -5756,6 +5830,21 @@ class GatewayRunner:
+ 
+         # Load conversation history from transcript
+         history = self.session_store.load_transcript(session_entry.session_id)
++
++        # If this is a parallel fork, prepend the parent session's conversation
++        # history so the fork has context about the ongoing conversation.
++        # The fork's own (empty) transcript goes AFTER inherited_context so
++        # the fork can make its own entries without contaminating the parent.
++        if inherited_context:
++            _fork_note = {
++                "role": "system",
++                "content": (
++                    "[System note: This is a parallel turn running alongside "
++                    "the main agent. Below is the main conversation history "
++                    "for context up to this point.]"
++                ),
++            }
++            history = [_fork_note] + list(inherited_context) + history
+         
+         # -----------------------------------------------------------------
+         # Session hygiene: auto-compress pathologically large transcripts
+@@ -6588,6 +6677,158 @@ class GatewayRunner:
+             # Restore session context variables to their pre-handler state
+             self._clear_session_env(_session_env_tokens)
+ 
++    async def _run_concurrent_turn(self, event, source, parent_key: str):
++        """Run a concurrent turn in parallel with an existing running agent.
++        
++        Creates a forked session (via session_key_override) so this turn runs
++        independently without interrupting the main conversation. The original
++        source is preserved so chat_id stays an int (required by Telegram et al.).
++        
++        Each parallel agent receives coordination context in its system prompt
++        listing its siblings, so it can avoid conflicting on shared resources.
++        """
++        import time as _time
++
++        _fork_ts = int(_time.time())
++        _fork_key = f"{parent_key}-c{_fork_ts}"
++
++        # Cap: only one parallel agent per session at a time.
++        # If there's already a parallel fork running, queue this message
++        # instead of spawning another agent that would cascade conflicts.
++        if parent_key in self._parallel_agents and self._parallel_agents[parent_key]:
++            logger.debug(
++                "Parallel cap hit for session %s — queuing message (fork %s blocked)",
++                parent_key, _fork_key,
++            )
++            adapter = self.adapters.get(source.platform)
++            if adapter:
++                merge_pending_message_event(adapter._pending_messages, parent_key, event)
++                try:
++                    _thread_meta = {"thread_id": source.thread_id} if source.thread_id else None
++                    await adapter._send_with_retry(
++                        chat_id=source.chat_id,
++                        content="⏳ One parallel task already running — queued for next slot.",
++                        reply_to=event.message_id,
++                        metadata=_thread_meta,
++                    )
++                except Exception:
++                    pass
++            return
++
++        # Snapshot the parent session's conversation history so the fork
++        # has context about the conversation it is running alongside.
++        _parent_history: List[Dict[str, Any]] = []
++        try:
++            _parent_entry = self.session_store._entries.get(parent_key)
++            if _parent_entry:
++                _parent_history = self.session_store.load_transcript(_parent_entry.session_id)
++        except Exception as _ph_exc:
++            logger.debug(
++                "Failed to load parent transcript for fork %s: %s",
++                _fork_key, _ph_exc,
++            )
++
++        # Register this parallel agent so siblings know about each other
++        if parent_key not in self._parallel_agents:
++            self._parallel_agents[parent_key] = {}
++        _msg_preview = (event.text or "")[:40]
++        self._parallel_agents[parent_key][_fork_key] = {
++            "start_time": _time.time(),
++            "message_preview": _msg_preview,
++        }
++
++        # Build coordination context with sibling awareness
++        _siblings = [k for k in self._parallel_agents.get(parent_key, {}).keys() if k != _fork_key]
++        _info_lines = ["## Parallel Coordination", ""]
++        _info_lines.append(f"You are parallel agent **{_fork_key}**.")
++        if _siblings:
++            _info_lines.append(f"Siblings currently running: {', '.join(_siblings)}")
++        else:
++            _info_lines.append("No other siblings currently running.")
++        _info_lines.append("")
++        _info_lines.append(
++            "You are running alongside other agents in the same chat. "
++            "Coordinate to avoid conflicts:"
++        )
++        _info_lines.append("- Before modifying files or shared state, check if a sibling has claimed the resource.")
++        _info_lines.append("- If a sibling is doing related work, wait or ask the user for guidance.")
++        _info_lines.append("- Do NOT modify files another agent has claimed or is actively working on.")
++        _info_lines.append("- If you detect a conflict, back off and let the other agent finish.")
++        _info_lines.append("- When you finish, your sibling agents will see your results naturally.")
++        _info_lines.append("- You cannot communicate directly with siblings — coordinate through shared state.")
++        _parallel_context = "\n".join(_info_lines)
++
++        try:
++            # Run the full message pipeline with the original source but a
++            # forked session key.  Session isolation comes from the key, not
++            # from mangling the source's chat_id.
++            _result = await self._handle_message_with_agent(
++                event, source, _fork_key, 0,
++                session_key_override=_fork_key,
++                parallel_context_text=_parallel_context,
++                inherited_context=_parent_history,
++            )
++
++            if _result and isinstance(_result, str):
++                # Deliver the response to the ORIGINAL chat (not the fork)
++                _adapter = self.adapters.get(source.platform)
++                if _adapter:
++                    _preview = (event.text or "")[:60].replace("\n", " ")
++                    _header = f"⚡ [Parallel — \"{_preview}...\"]\n\n"
++                    if _result.startswith("Sorry, I encountered an error"):
++                        await _adapter.send(
++                            source.chat_id,
++                            f"⚠️ Parallel turn failed:\n\n{_result}",
++                        )
++                    else:
++                        await _adapter.send(
++                            source.chat_id,
++                            _header + _result,
++                        )
++        except asyncio.CancelledError:
++            logger.debug("Concurrent turn cancelled for session %s", parent_key)
++        except Exception as exc:
++            logger.exception("Concurrent turn failed for session %s: %s", parent_key, exc)
++            _adapter = self.adapters.get(source.platform)
++            if _adapter:
++                await _adapter.send(
++                    source.chat_id,
++                    f"⚠️ Parallel turn failed: {exc}",
++                )
++        finally:
++            # Clean up: remove this fork from the tracking dict
++            _parent_agents = self._parallel_agents.get(parent_key)
++            if _parent_agents and _fork_key in _parent_agents:
++                del _parent_agents[_fork_key]
++                if not _parent_agents:
++                    del self._parallel_agents[parent_key]
++
++    def _get_parallel_agents_status(self, session_key: str) -> str:
++        """Return a one-line summary of running parallel agents for this session.
++        
++        Example output:
++          "Parallel agents running: agent-abc123-c1705040000 (18s ago: 'deploy the...'), agent-abc123-c1705040001 (5s ago: 'check logs...')"
++        """
++        import time as _status_time
++        forks = self._parallel_agents.get(session_key, {})
++        if not forks:
++            return ""
++        parts = []
++        now = _status_time.time()
++        for fork_key in sorted(forks.keys()):
++            meta = forks[fork_key]
++            start = meta.get("start_time", now)
++            elapsed = now - start
++            preview = meta.get("message_preview", "")
++            if elapsed < 60:
++                time_str = f"{int(elapsed)}s ago"
++            else:
++                mins = int(elapsed // 60)
++                secs = int(elapsed % 60)
++                time_str = f"{mins}m {secs}s ago" if secs else f"{mins}m ago"
++            parts.append(f"{fork_key} ({time_str}: '{preview}...')")
++        return f"Parallel agents running: {', '.join(parts)}"
++
+     def _format_session_info(self) -> str:
+         """Resolve current model config and return a formatted info block.
+ 
+@@ -8187,19 +8428,29 @@ class GatewayRunner:
+                 chat_type="channel",
+             )
+ 
++        # Domain-idea channels: ingest the transcript and skip the normal
++        # agent reply flow — the bot stays silent except for periodic ideas.
++        # Runs BEFORE the auth check so every speaker in the VC contributes,
++        # not just allowlisted users.
++        if self._domain_service is not None and self._domain_service.enabled_for(text_ch_id):
++            self._domain_service.ingest(int(text_ch_id), str(user_id), transcript)
++            return
++
+         # Check authorization before processing voice input
+         if not self._is_user_authorized(source):
+             logger.debug("Unauthorized voice input from user %d, ignoring", user_id)
+             return
+ 
+-        # Show transcript in text channel (after auth, with mention sanitization)
+-        try:
+-            channel = adapter._client.get_channel(text_ch_id)
+-            if channel:
+-                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+-                await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
+-        except Exception:
+-            pass
++        # Show transcript in text channel (after auth, with mention sanitization).
++        # Opt out with DISCORD_POST_VOICE_TRANSCRIPTS=false.
++        if os.getenv("DISCORD_POST_VOICE_TRANSCRIPTS", "true").lower() not in ("false", "0", "no"):
++            try:
++                channel = adapter._client.get_channel(text_ch_id)
++                if channel:
++                    safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
++                    await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
++            except Exception:
++                pass
+ 
+         # Build a synthetic MessageEvent and feed through the normal pipeline
+         # Use SimpleNamespace as raw_message so _get_guild_id() can extract
+@@ -8661,6 +8912,15 @@ class GatewayRunner:
+             except Exception:
+                 pass
+ 
++    async def _handle_parallel_command(self, event: MessageEvent) -> str:
++        """Handle /parallel — show running parallel agents for this session."""
++        source = event.source
++        session_key = self._session_key_for_source(source)
++        status = self._get_parallel_agents_status(session_key)
++        if not status:
++            return "No parallel agents currently running for this session."
++        return status
++
+     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
+         """Handle /reasoning command — manage reasoning effort and display toggle.
+ 
+diff --git a/gateway/session.py b/gateway/session.py
+index 3129f7a32..ba2384757 100644
+--- a/gateway/session.py
++++ b/gateway/session.py
+@@ -177,6 +177,12 @@ class SessionContext:
+     created_at: Optional[datetime] = None
+     updated_at: Optional[datetime] = None
+     
++    # Parallel coordination context — injected into the system prompt when
++    # this agent is a concurrent/forked turn running alongside other agents.
++    # Set by the gateway before spawning the agent; consumed by
++    # build_session_context_prompt.
++    parallel_context_text: str = ""
++    
+     def to_dict(self) -> Dict[str, Any]:
+         return {
+             "source": self.source.to_dict(),
+@@ -418,6 +424,11 @@ def build_session_context_prompt(
+     lines.append("")
+     lines.append("*For explicit targeting, use `\"platform:chat_id\"` format if the user provides a specific chat ID.*")
+ 
++    # Parallel coordination context for concurrent/forked turns
++    if context.parallel_context_text:
++        lines.append("")
++        lines.append(context.parallel_context_text)
++
+     return "\n".join(lines)
+ 
+ 
+@@ -850,15 +861,18 @@ class SessionStore:
+     def get_or_create_session(
+         self,
+         source: SessionSource,
+-        force_new: bool = False
++        force_new: bool = False,
++        session_key_override: Optional[str] = None,
+     ) -> SessionEntry:
+         """
+         Get an existing session or create a new one.
+ 
+         Evaluates reset policy to determine if the existing session is stale.
+         Creates a session record in SQLite when a new session starts.
++        ``session_key_override`` provides an explicit session key instead of
++        deriving one from the source — used for parallel/forked sessions.
+         """
+-        session_key = self._generate_session_key(source)
++        session_key = session_key_override or self._generate_session_key(source)
+         now = _now()
+ 
+         # SQLite calls are made outside the lock to avoid holding it during I/O.
