@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/hermes-parallel-banner.png" alt="Hermes Parallel Calling banner" width="100%">
+</p>
+
 # Hermes Parallel Calling
 
 **Concurrent agent turns, session context forking, and parallel agent status for [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
@@ -68,29 +72,13 @@ Only one parallel agent per parent session at a time. If a second message arrive
 
 ## Architecture
 
-```
-User sends message while agent busy
-         │
-         ▼
-  _handle_active_session_busy_message()
-         │
-         ├── interrupt mode → interrupt running agent, queue message
-         ├── queue mode → merge into pending_messages
-         ├── steer mode → inject text via agent.steer()
-         └── concurrent mode → _run_concurrent_turn()
-                                    │
-                                    ▼
-                           Snapshot parent transcript
-                           Create forked session (session_key_override)
-                           Register in _parallel_agents dict
-                           Inject inherited_context + parallel_context
-                           Spawn _handle_message_with_agent()
-                           Run independently in asyncio.create_task()
-                                    │
-                                    ▼
-                           Deliver response back to original chat
-                           Clean up _parallel_agents entry
-```
+<p align="center">
+  <img src="docs/hermes-parallel-arch.png" alt="Architecture flow diagram" width="90%">
+</p>
+
+<p align="center">
+  <img src="docs/hermes-parallel-sequence.png" alt="Parallel agent forking sequence diagram" width="90%">
+</p>
 
 ## Key Implementation Details
 
