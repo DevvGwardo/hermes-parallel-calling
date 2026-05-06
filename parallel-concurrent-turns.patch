@@ -71,8 +71,8 @@ index aadb067dc..8b6e84b36 100644
 +                        reply_to=event.message_id,
 +                        metadata=_thread_meta,
 +                    )
-+                except Exception:
-+                    pass
++                except Exception as _exc:
++                    logger.debug("Failed to send parallel ack for session %s: %s", session_key, _exc)
 +            return True
 +
          # Store the message so it's processed as the next turn after the
@@ -106,8 +106,8 @@ index aadb067dc..8b6e84b36 100644
 +            if self._domain_service is not None:
 +                try:
 +                    await self._domain_service.stop()
-+                except Exception:
-+                    pass
++                except Exception as _exc:
++                    logger.warning("DomainIdeaService failed to stop: %s", _exc, exc_info=True)
  
              # Notify all chats with active agents BEFORE draining.
              # Adapters are still connected here, so messages can be sent.
@@ -233,8 +233,8 @@ index aadb067dc..8b6e84b36 100644
 +                            reply_to=event.message_id,
 +                            metadata=_thread_meta,
 +                        )
-+                    except Exception:
-+                        pass
++                    except Exception as _exc:
++                        logger.debug("Failed to send parallel-queue notice for session %s: %s", parent_key, _exc)
 +                return
 +
 +        # Phase 2: Outside the lock — load history, build context, run agent.
