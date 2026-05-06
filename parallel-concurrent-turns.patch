@@ -10,6 +10,8 @@ index aadb067dc..8b6e84b36 100644
 +    # Registered in _run_concurrent_turn, cleared when the parallel turn completes.
 +    # Initialized in __init__ alongside _running_agents.
 +    _parallel_agents: Dict[str, Dict[str, dict]] = {}  # class-level default only
++    # Per-session locks to prevent TOCTOU races on the parallel-agent cap.
++    _parallel_locks: Dict[str, asyncio.Lock] = {}  # lazily instantiated
      _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
      _exit_code: Optional[int] = None
      _draining: bool = False
@@ -18,6 +20,7 @@ index aadb067dc..8b6e84b36 100644
          self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
          self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
 +        self._parallel_agents: Dict[str, Dict[str, dict]] = {}  # parallel fork tracking: parent_key -> {fork_key: {start_time, message_preview}}
++        self._parallel_locks: Dict[str, asyncio.Lock] = {}  # per-session locks for parallel-agent cap
          # Overflow buffer for explicit /queue commands.  The adapter-level
          # _pending_messages dict is a single slot per session (designed for
          # "next-turn" follow-ups where repeated sends collapse into one
@@ -207,29 +210,34 @@ index aadb067dc..8b6e84b36 100644
 +        _fork_ts = int(_time.time())
 +        _fork_key = f"{parent_key}-c{_fork_ts}"
 +
-+        # Cap: only one parallel agent per session at a time.
-+        # If there's already a parallel fork running, queue this message
-+        # instead of spawning another agent that would cascade conflicts.
-+        if parent_key in self._parallel_agents and self._parallel_agents[parent_key]:
-+            logger.debug(
-+                "Parallel cap hit for session %s — queuing message (fork %s blocked)",
-+                parent_key, _fork_key,
-+            )
-+            adapter = self.adapters.get(source.platform)
-+            if adapter:
-+                merge_pending_message_event(adapter._pending_messages, parent_key, event)
-+                try:
-+                    _thread_meta = {"thread_id": source.thread_id} if source.thread_id else None
-+                    await adapter._send_with_retry(
-+                        chat_id=source.chat_id,
-+                        content="⏳ One parallel task already running — queued for next slot.",
-+                        reply_to=event.message_id,
-+                        metadata=_thread_meta,
-+                    )
-+                except Exception:
-+                    pass
-+            return
++        # Phase 1: Lock-protected check + registration (fast critical section).
++        # Prevents a TOCTOU race where two concurrent messages both see the
++        # cap as open and register before either can block the other.
++        async with self._get_parallel_lock(parent_key):
++            # Cap: only one parallel agent per session at a time.
++            # If there's already a parallel fork running, queue this message
++            # instead of spawning another agent that would cascade conflicts.
++            if parent_key in self._parallel_agents and self._parallel_agents[parent_key]:
++                logger.debug(
++                    "Parallel cap hit for session %s — queuing message (fork %s blocked)",
++                    parent_key, _fork_key,
++                )
++                adapter = self.adapters.get(source.platform)
++                if adapter:
++                    merge_pending_message_event(adapter._pending_messages, parent_key, event)
++                    try:
++                        _thread_meta = {"thread_id": source.thread_id} if source.thread_id else None
++                        await adapter._send_with_retry(
++                            chat_id=source.chat_id,
++                            content="⏳ One parallel task already running — queued for next slot.",
++                            reply_to=event.message_id,
++                            metadata=_thread_meta,
++                        )
++                    except Exception:
++                        pass
++                return
 +
++        # Phase 2: Outside the lock — load history, build context, run agent.
 +        # Snapshot the parent session's conversation history so the fork
 +        # has context about the conversation it is running alongside.
 +        _parent_history: List[Dict[str, Any]] = []
@@ -243,14 +251,14 @@ index aadb067dc..8b6e84b36 100644
 +                _fork_key, _ph_exc,
 +            )
 +
-+        # Register this parallel agent so siblings know about each other
-+        if parent_key not in self._parallel_agents:
-+            self._parallel_agents[parent_key] = {}
-+        _msg_preview = (event.text or "")[:40]
-+        self._parallel_agents[parent_key][_fork_key] = {
-+            "start_time": _time.time(),
-+            "message_preview": _msg_preview,
-+        }
++            # Register this parallel agent so siblings know about each other
++            if parent_key not in self._parallel_agents:
++                self._parallel_agents[parent_key] = {}
++            _msg_preview = (event.text or "")[:40]
++            self._parallel_agents[parent_key][_fork_key] = {
++                "start_time": _time.time(),
++                "message_preview": _msg_preview,
++            }
 +
 +        # Build coordination context with sibling awareness
 +        _siblings = [k for k in self._parallel_agents.get(parent_key, {}).keys() if k != _fork_key]
@@ -311,13 +319,22 @@ index aadb067dc..8b6e84b36 100644
 +                    f"⚠️ Parallel turn failed: {exc}",
 +                )
 +        finally:
++            async with self._get_parallel_lock(parent_key):
 +            # Clean up: remove this fork from the tracking dict
-+            _parent_agents = self._parallel_agents.get(parent_key)
-+            if _parent_agents and _fork_key in _parent_agents:
-+                del _parent_agents[_fork_key]
-+                if not _parent_agents:
-+                    del self._parallel_agents[parent_key]
++                _parent_agents = self._parallel_agents.get(parent_key)
++                if _parent_agents and _fork_key in _parent_agents:
++                    del _parent_agents[_fork_key]
++                    if not _parent_agents:
++                        del self._parallel_agents[parent_key]
 +
++    def _get_parallel_lock(self, parent_key: str) -> asyncio.Lock:
++        """Return (and lazily create) a per-session lock for the parallel-agent cap."""
++        lock = self._parallel_locks.get(parent_key)
++        if lock is None:
++            lock = asyncio.Lock()
++            self._parallel_locks[parent_key] = lock
++        return lock
+
 +    def _get_parallel_agents_status(self, session_key: str) -> str:
 +        """Return a one-line summary of running parallel agents for this session.
 +        
