@@ -54,9 +54,11 @@ index aadb067dc..8b6e84b36 100644
 +                "Concurrent follow-up via busy handler for session %s — dispatching parallel turn",
 +                session_key,
 +            )
-+            asyncio.create_task(
++            _task = asyncio.create_task(
 +                self._run_concurrent_turn(event, event.source, session_key)
 +            )
++            self._background_tasks.add(_task)
++            _task.add_done_callback(self._background_tasks.discard)
 +            # Acknowledge so the user knows a parallel turn started.
 +            adapter = self.adapters.get(event.source.platform)
 +            if adapter:
@@ -117,9 +119,11 @@ index aadb067dc..8b6e84b36 100644
                  return None
 +            if self._busy_input_mode == "concurrent":
 +                logger.debug("PRIORITY concurrent for session %s — dispatching parallel turn", _quick_key)
-+                asyncio.create_task(
++                _task = asyncio.create_task(
 +                    self._run_concurrent_turn(event, source, _quick_key)
 +                )
++                self._background_tasks.add(_task)
++                _task.add_done_callback(self._background_tasks.discard)
 +                return None
              logger.debug("PRIORITY interrupt for session %s", _quick_key)
              running_agent.interrupt(event.text)
